@@ -1,0 +1,21 @@
+# Output files
+galileo_traces.csv
+galileo_traces.json
+
+# Local secrets
+.env
+.env.local
+*.pem
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.python-version
+
+# IDE / OS
+.DS_Store
+.vscode/
+.idea/
