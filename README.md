@@ -1,8 +1,13 @@
-# galileo-log-puller
+# galileo-log-puller + protect example
 
-A small Python script to pull traces from a Galileo log stream into a CSV and JSONL on your machine, so you can wrangle the results in a DataFrame, compare across runs, or feed them into your own reporting.
+Two small standalone scripts that use the official `galileo` Python SDK — no raw HTTP calls.
 
-Uses the official `galileo` Python SDK end-to-end — no raw HTTP calls.
+1. **`pull_galileo_logs.py`** — pull traces from a Galileo log stream into a CSV and JSONL on your machine, so you can wrangle the results in a DataFrame, compare across runs, or feed them into your own reporting.
+2. **`protect_quickstart_example.py`** — minimal example showing how to wrap [Galileo Protect](https://docs.galileo.ai/) around a quickstart-style OpenAI agent so prompt-injection attempts are blocked before they reach the LLM.
+
+---
+
+## pull_galileo_logs.py
 
 ## What it pulls
 
@@ -55,6 +60,59 @@ In the directory you specified:
 - `galileo_traces.json` — same data as JSONL (one trace per line), useful if you'd rather work in JSON than tabular form
 
 The script also prints a summary of which metric columns were populated and how many traces each one covered — easy way to confirm your scorers actually ran on the test cases you sent.
+
+---
+
+## protect_quickstart_example.py
+
+Shows the quickstart pattern plus a runtime guardrail. Sends a benign prompt and a prompt-injection attempt through the same code path. The benign one reaches the LLM; the injection one is blocked by Galileo Protect before any LLM call is made.
+
+### Install
+
+```bash
+pip install --upgrade galileo openai
+```
+
+### Configure
+
+```bash
+export GALILEO_API_KEY="..."
+export GALILEO_PROJECT="<your project name>"
+export GALILEO_LOG_STREAM="<your log stream name, e.g. production>"
+export GALILEO_CONSOLE_URL="https://console.<your-cluster>.galileocloud.io"
+export OPENAI_API_KEY="..."
+```
+
+### Run
+
+```bash
+python protect_quickstart_example.py
+```
+
+You'll see two scenarios printed back-to-back: scenario 1 returns a normal LLM reply, scenario 2 returns `[BLOCKED BY GALILEO PROTECT]` and skips the LLM entirely.
+
+### What it's doing
+
+```python
+PROMPT_INJECTION_RULESET = Ruleset(
+    description="Block prompt injection attempts on user input",
+    action="OVERRIDE",
+    rules=[Rule(metric="prompt_injection_luna", operator="eq", target_value=True)],
+)
+
+protect_response = invoke_protect(
+    payload=Payload(input=user_input, output=""),
+    prioritized_rulesets=[PROMPT_INJECTION_RULESET],
+    project_name=os.environ["GALILEO_PROJECT"],
+)
+
+if protect_response.status == ExecutionStatus.triggered:
+    return "[BLOCKED]"   # skip the LLM
+```
+
+To add more checks — input PII, toxicity, sexism, SQL injection — add more `Rule` entries to the `Ruleset` or define additional `Ruleset`s. The full list of available scorer metrics is in the Galileo SDK (`GalileoScorers`).
+
+---
 
 ## License
 
