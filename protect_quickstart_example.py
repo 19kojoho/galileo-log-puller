@@ -38,7 +38,7 @@ from __future__ import annotations
 import os
 import sys
 
-from galileo import galileo_context, invoke_protect
+from galileo import galileo_context, invoke_protect, log
 from galileo.openai import openai
 from galileo_core.schemas.protect.execution_status import ExecutionStatus
 from galileo_core.schemas.protect.payload import Payload
@@ -63,9 +63,14 @@ RULESETS = [
 ]
 
 
+@log(name="protect_input", span_type="tool")
 def evaluate_input(user_input: str, stage_name: str, project_name: str) -> Response:
     """Run the user input through every ruleset. Returns the first one that
-    triggers (in priority order). If none trigger, returns the final response."""
+    triggers (in priority order). If none trigger, returns the final response.
+
+    Wrapped with @log so the Protect call shows up as a `protect_input` span
+    inside the agent trace tree — that's what makes the guardrail visible in
+    the Galileo UI alongside the LLM call."""
     return invoke_protect(
         payload=Payload(input=user_input, output=""),
         prioritized_rulesets=RULESETS,
@@ -74,9 +79,16 @@ def evaluate_input(user_input: str, stage_name: str, project_name: str) -> Respo
     )
 
 
+@log(name="agent_turn", span_type="agent")
 def chat_with_guardrail(user_input: str) -> str:
     """Pattern Olu asked about: check the input before calling the LLM,
-    then decide based on the verdict."""
+    then decide based on the verdict.
+
+    Wrapped with @log so the whole turn shows up as one agent-level trace
+    in the Galileo log stream — input, verdict, LLM child span (if called),
+    and final output, all on one tree. The invoke_protect call itself still
+    lands in the Protect/Stages section separately.
+    """
 
     project_name = os.environ["GALILEO_PROJECT"]
     stage_name = os.getenv("GALILEO_PROTECT_STAGE", "poc-protect-stage")
@@ -96,6 +108,8 @@ def chat_with_guardrail(user_input: str) -> str:
         return "[BLOCKED] Your input was flagged as containing sensitive data."
 
     # 3. Not triggered — safe to call the LLM.
+    # The galileo-wrapped openai client auto-creates a child LLM span
+    # under this @log-decorated parent.
     print(f"  Action          : PASS — sending to LLM")
     client = openai.OpenAI()
     reply = client.chat.completions.create(
@@ -131,6 +145,10 @@ def main() -> int:
         print(f"  Input           : {user_input}")
         reply = chat_with_guardrail(user_input)
         print(f"  Reply           : {reply[:300]}")
+        # Flush after each scenario so each agent_turn lands as its own
+        # top-level trace in the log stream (rather than getting siblinged
+        # under one mega-trace).
+        galileo_context.flush()
         print()
 
     return 0
