@@ -1,0 +1,8 @@
+# Runtime deps for protect-shim. Deliberately narrow — grpcio is the
+# ext_proc server surface; the galileo SDK is used to call invoke_protect
+# without hand-rolling the HTTP contract. httpx is included as a fallback
+# for cases where we need to call the Protect REST endpoint directly.
+grpcio==1.66.2
+protobuf==5.28.2
+httpx==0.27.2
+galileo>=1.0.0

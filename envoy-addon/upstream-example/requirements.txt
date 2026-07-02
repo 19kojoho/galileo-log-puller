@@ -1,0 +1,4 @@
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+# Everything else (galileo, openai) is inherited from the root requirements.txt
+# — this wrapper imports chat_with_guardrail from there.
