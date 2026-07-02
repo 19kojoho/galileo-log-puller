@@ -1,0 +1,209 @@
+# envoy.yaml — reference Envoy configuration for the Galileo Protect ext_proc pattern.
+#
+# Every stanza here is annotated so that a bank-side platform team (specifically
+# a platform team) can port these knobs directly onto their existing Envoy
+# fleet without having to re-derive intent. Where a value is a knob (fail
+# open/closed, timeouts, buffer size), we explain the trade-off inline.
+#
+# Envoy version: v1.32 series (matches image in docker-compose.yml).
+# ext_proc filter documentation:
+#   https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/ext_proc_filter
+
+admin:
+  # Admin interface — used by the latency benchmark to toggle filter state and
+  # by tests/ to read stats. DO NOT expose this port outside the cluster in
+  # production. It ships listening on 0.0.0.0 in this POC only because Docker
+  # networking makes localhost binding awkward.
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: 9901
+
+static_resources:
+
+  # -------------------------------------------------------------------------
+  # LISTENERS
+  # -------------------------------------------------------------------------
+  listeners:
+  - name: client_ingress
+    address:
+      socket_address:
+        address: 0.0.0.0
+        port_value: 8080
+
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: ingress_http
+          codec_type: AUTO
+
+          # -----------------------------------------------------------------
+          # LOCAL REPLY — clean fail-closed presentation
+          # When the ext_proc filter can't reach the shim (shim down, gRPC
+          # error, timeout), Envoy would default to an ugly empty 500. We
+          # intercept that here and rewrite to HTTP 503 with a structured
+          # JSON body identifying the failure as a guardrail-availability
+          # issue, and echo Envoy's x-request-id so app teams can quote it.
+          #
+          # ext_proc failure surfaces to Envoy as UAEX (upstream/ext_proc
+          # error) or a 5xx status. We match on both.
+          # -----------------------------------------------------------------
+          local_reply_config:
+            mappers:
+            - filter:
+                or_filter:
+                  filters:
+                  - status_code_filter:
+                      comparison:
+                        op: GE
+                        value:
+                          default_value: 500
+                          runtime_key: local_reply.min_error_status
+                  - status_code_filter:
+                      comparison:
+                        op: EQ
+                        value:
+                          default_value: 408
+                          runtime_key: local_reply.timeout_status
+              status_code: 503
+              headers_to_add:
+              - header: { key: "content-type", value: "application/json" }
+              - header: { key: "x-guardrail-decision", value: "block" }
+              - header: { key: "x-guardrail-stage", value: "guardrail_unavailable" }
+              - header: { key: "x-guardrail-request-id", value: "%REQ(x-request-id)%" }
+              body_format_override:
+                json_format:
+                  # Envoy's json_format doesn't accept null, so we use an
+                  # empty string to signal "no rule fired — this is a
+                  # guardrail-availability failure, not a policy hit."
+                  blocked: "true"
+                  stage: "guardrail_unavailable"
+                  fired_rule: ""
+                  request_id: "%REQ(x-request-id)%"
+
+          # -----------------------------------------------------------------
+          # ROUTES
+          # OpenAI-compatible chat completions endpoint routes to mock-llm.
+          # Your production Envoy will route to your actual LLM endpoint.
+          # -----------------------------------------------------------------
+          route_config:
+            name: chat_completions_route
+            virtual_hosts:
+            - name: chat_backend
+              domains: ["*"]
+              routes:
+              - match: { prefix: "/" }
+                route:
+                  cluster: mock_llm
+                  timeout: 60s
+
+          # -----------------------------------------------------------------
+          # HTTP FILTER CHAIN
+          # The ext_proc filter runs BEFORE the router filter, giving it a
+          # chance to hold the request, consult Protect, and short-circuit
+          # with an ImmediateResponse if the verdict is TRIGGERED.
+          # -----------------------------------------------------------------
+          http_filters:
+
+          - name: envoy.filters.http.ext_proc
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+
+              # Which gRPC service to call for policy decisions
+              grpc_service:
+                envoy_grpc:
+                  cluster_name: protect_shim
+                # Total time budget per ext_proc MESSAGE (not per stream).
+                # Increase for very large payloads; decrease for stricter SLA.
+                # Must be > PROTECT_TIMEOUT_S in the shim so the shim gets a
+                # chance to return an orderly response before Envoy gives up.
+                timeout: 10s
+
+              # If the shim goes down or returns errors, DENY by default.
+              # Your production preference will drive this — for
+              # regulated workloads, fail-closed is typical. Toggle to `true`
+              # to demo fail-open behavior at the Envoy layer.
+              failure_mode_allow: false
+
+              # BUFFERED for both request and response body: the entire body
+              # is held until the shim returns a verdict. This is the mode
+              # we need to inspect full prompt / full completion.
+              #
+              # STREAMED / CHUNKED body modes are NOT used in v1 — see the
+              # "Known limitations" section in docs/README.md for the
+              # trade-off (streaming LLM responses need different handling).
+              processing_mode:
+                request_header_mode: SEND
+                response_header_mode: SEND
+                request_body_mode: BUFFERED
+                response_body_mode: BUFFERED
+                request_trailer_mode: SKIP
+                response_trailer_mode: SKIP
+
+              # Maximum message size the shim will accept per direction.
+              # OpenAI-shaped chat payloads are usually small (<64 KB) but
+              # long RAG contexts can push this — 1 MB is safe headroom.
+              message_timeout: 10s
+
+              # Metadata added to Protect requests. Useful when running
+              # against a tenant that filters by service / route / caller.
+              # Vivek's Envoy config will likely populate these from headers.
+              metadata_options:
+                forwarding_namespaces:
+                  untyped:
+                  - envoy.filters.http.header_to_metadata
+
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+
+  # -------------------------------------------------------------------------
+  # CLUSTERS
+  # -------------------------------------------------------------------------
+  clusters:
+
+  # The Galileo Protect shim (gRPC ext_proc server). HTTP/2 only.
+  - name: protect_shim
+    type: STRICT_DNS
+    lb_policy: ROUND_ROBIN
+    # connect_timeout is what drives fail-fast when the shim is down.
+    # Lowered from 5s → 1s so kill-the-shim demos surface an immediate
+    # 503, not a stalled connection. Tune upward in high-latency network
+    # environments (some sidecar meshes take >1s to establish a fresh
+    # connection).
+    connect_timeout: 1s
+    typed_extension_protocol_options:
+      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+        "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+        explicit_http_config:
+          http2_protocol_options: {}
+    load_assignment:
+      cluster_name: protect_shim
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: protect-shim   # docker-compose service name
+                port_value: 50051
+
+  # The upstream LLM. In this POC it's a canned FastAPI echo.
+  # In your env, this becomes your actual model endpoint (or LiteLLM,
+  # or Bedrock inference profile — the choice is theirs, the pattern is the
+  # same).
+  - name: mock_llm
+    type: STRICT_DNS
+    lb_policy: ROUND_ROBIN
+    connect_timeout: 5s
+    load_assignment:
+      cluster_name: mock_llm
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: mock-llm   # docker-compose service name
+                port_value: 8000

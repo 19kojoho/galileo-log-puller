@@ -1,0 +1,70 @@
+# envoy-addon — network-layer guardrail in front of a Galileo-instrumented agent.
+#
+#   client
+#     │  HTTP :8080
+#     ▼
+#   envoy  ──── gRPC :50051 ────▶  protect-shim  ──── HTTPS ────▶  Galileo Invoke Protect API
+#     │                                                              (your Galileo cluster)
+#     │  HTTP (only if request allowed)
+#     ▼
+#   UPSTREAM  ──────►  set via UPSTREAM_URL in .env
+#
+# Two ways to use this:
+#
+#   A) Sanity test (default) — the bundled mock-llm answers so you can prove
+#      the ext_proc path end-to-end before wiring your real agent.
+#      Set UPSTREAM_URL=http://mock-llm:8000 and run `make demo`.
+#
+#   B) Guard your real agent — expose your agent as an OpenAI-compatible
+#      HTTP endpoint (see upstream-example/) and set UPSTREAM_URL to point
+#      at it. Envoy will call Protect on every request, then forward to
+#      your agent if allowed.
+
+services:
+
+  envoy:
+    image: envoyproxy/envoy:v1.32-latest
+    container_name: envoy-addon-envoy
+    ports:
+      - "8080:8080"   # client-facing listener
+      - "9901:9901"   # Envoy admin — do NOT expose in production
+    volumes:
+      - ./envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
+    command:
+      - /usr/local/bin/envoy
+      - --config-path
+      - /etc/envoy/envoy.yaml
+      - --log-level
+      - info
+    depends_on:
+      protect-shim:
+        condition: service_started
+    networks:
+      - envoy-addon
+
+  protect-shim:
+    build:
+      context: ./shim
+      dockerfile: Dockerfile
+    container_name: envoy-addon-shim
+    env_file: .env
+    environment:
+      SHIM_LISTEN_ADDR: "0.0.0.0:50051"
+    networks:
+      - envoy-addon
+
+  # OPTIONAL — the bundled mock-llm. Comment out if you're routing to your
+  # own agent via UPSTREAM_URL, or keep it running for smoke tests.
+  mock-llm:
+    build:
+      context: ./mock-llm
+      dockerfile: Dockerfile
+    container_name: envoy-addon-mock-llm
+    ports:
+      - "8001:8000"   # host-exposed for direct sanity check
+    networks:
+      - envoy-addon
+
+networks:
+  envoy-addon:
+    driver: bridge
